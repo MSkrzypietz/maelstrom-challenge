@@ -2,59 +2,79 @@ package main
 
 import (
 	"encoding/json"
-	"log"
-
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
+	"log"
 )
 
+type Topology = map[string][]string
+
+var n *maelstrom.Node
+var messages map[int]struct{}
+var topology Topology
+
 func main() {
-    n := maelstrom.NewNode()
+	n = maelstrom.NewNode()
+	messages = map[int]struct{}{}
 
-    var values []int
+	n.Handle("broadcast", broadcastHandler)
+	n.Handle("read", readHandler)
+	n.Handle("topology", topologyHandler)
 
-    n.Handle("broadcast", func(msg maelstrom.Message) error {
-        var body map[string]any
-        if err := json.Unmarshal(msg.Body, &body); err != nil {
-            return err
-        }
+	if err := n.Run(); err != nil {
+		log.Fatal(err)
+	}
+}
 
-        body["type"] = "broadcast_ok"
-        value, ok := body["message"].(float64)
-        if ok {
-            values = append(values, int(value))
-        } 
-        
-        delete(body, "message")
+func broadcastHandler(msg maelstrom.Message) error {
+	var body map[string]any
+	if err := json.Unmarshal(msg.Body, &body); err != nil {
+		return err
+	}
 
-        return n.Reply(msg, body)
-    })
+	body["type"] = "broadcast_ok"
+	message, ok := body["message"].(float64)
+	if ok {
+		messages[int(message)] = struct{}{}
+	}
 
-    n.Handle("read", func(msg maelstrom.Message) error {
-        var body map[string]any
-        if err := json.Unmarshal(msg.Body, &body); err != nil {
-            return err
-        }
+	delete(body, "message")
 
-        body["type"] = "read_ok"
-        body["messages"] = values
+	return n.Reply(msg, body)
+}
 
-        return n.Reply(msg, body)
-    })
+func readHandler(msg maelstrom.Message) error {
+	var body map[string]any
+	if err := json.Unmarshal(msg.Body, &body); err != nil {
+		return err
+	}
 
-    n.Handle("topology", func(msg maelstrom.Message) error {
-        var body map[string]any
-        if err := json.Unmarshal(msg.Body, &body); err != nil {
-            return err
-        }
+	body["type"] = "read_ok"
+	body["messages"] = getMessages()
 
-        body["type"] = "topology_ok"
+	return n.Reply(msg, body)
+}
 
-        delete(body, "topology")
+func topologyHandler(msg maelstrom.Message) error {
+	var body map[string]any
+	if err := json.Unmarshal(msg.Body, &body); err != nil {
+		return err
+	}
 
-        return n.Reply(msg, body)
-    })
+	body["type"] = "topology_ok"
+	value, ok := body["topology"].(Topology)
+	if ok {
+		topology = value
+	}
 
-    if err := n.Run(); err != nil {
-        log.Fatal(err)
-    }
+	delete(body, "topology")
+
+	return n.Reply(msg, body)
+}
+
+func getMessages() []int {
+	var result []int
+	for message, _ := range messages {
+		result = append(result, message)
+	}
+	return result
 }
