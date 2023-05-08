@@ -11,24 +11,27 @@ import (
 )
 
 type Topology = map[string][]string
+type Messages map[int]struct{}
 
 var n *maelstrom.Node
-var messages map[int]struct{}
+var messages Messages
 var messagesMutex sync.Mutex
+var knownSyncMessages map[string]Messages
+var knownSyncMessagesMutex sync.Mutex
 var topology Topology
 
 func main() {
 	n = maelstrom.NewNode()
 	messages = map[int]struct{}{}
+	knownSyncMessages = map[string]Messages{}
 	topology = map[string][]string{}
 
 	n.Handle("broadcast", broadcastHandler)
 	n.Handle("read", readHandler)
 	n.Handle("topology", topologyHandler)
 	n.Handle("sync", syncHandler)
-	n.Handle("sync_ok", func(msg maelstrom.Message) error { return nil })
 
-	go syncJob(500 * time.Millisecond)
+	go syncScheduler(500 * time.Millisecond)
 
 	if err := n.Run(); err != nil {
 		log.Fatal(err)
@@ -44,7 +47,9 @@ func broadcastHandler(msg maelstrom.Message) error {
 	body["type"] = "broadcast_ok"
 	message, ok := body["message"].(float64)
 	if ok {
+		messagesMutex.Lock()
 		messages[int(message)] = struct{}{}
+		messagesMutex.Unlock()
 	}
 
 	delete(body, "message")
@@ -59,7 +64,7 @@ func readHandler(msg maelstrom.Message) error {
 	}
 
 	body["type"] = "read_ok"
-	body["messages"] = getMessages()
+	body["messages"] = getAllMessages()
 
 	return n.Reply(msg, body)
 }
@@ -82,13 +87,28 @@ func topologyHandler(msg maelstrom.Message) error {
 	return n.Reply(msg, body)
 }
 
-func getMessages() []int {
+func getAllMessages() []int {
 	messagesMutex.Lock()
 	defer messagesMutex.Unlock()
 
 	var result []int
-	for message, _ := range messages {
+	for message := range messages {
 		result = append(result, message)
+	}
+	return result
+}
+
+func getUnknownMessages(nodeID string) []int {
+	allMessages := getAllMessages()
+
+	knownSyncMessagesMutex.Lock()
+	defer knownSyncMessagesMutex.Unlock()
+
+	var result []int
+	for _, message := range allMessages {
+		if _, ok := knownSyncMessages[nodeID][message]; !ok {
+			result = append(result, message)
+		}
 	}
 	return result
 }
@@ -106,21 +126,42 @@ func syncHandler(msg maelstrom.Message) error {
 
 	body.Type = "sync_ok"
 	addMessages(body.Messages)
-	body.Messages = nil
+	addKnownSyncMessages(msg.Src, body.Messages)
+	body.Messages = getUnknownMessages(msg.Src)
 
 	return n.Reply(msg, body)
 }
 
 func addMessages(newMessages []int) {
+	if len(newMessages) == 0 {
+		return
+	}
+
 	messagesMutex.Lock()
 	defer messagesMutex.Unlock()
 
-	for message := range newMessages {
+	for _, message := range newMessages {
 		messages[message] = struct{}{}
 	}
 }
 
-func syncJob(duration time.Duration) {
+func addKnownSyncMessages(nodeID string, newMessages []int) {
+	if len(newMessages) == 0 {
+		return
+	}
+
+	knownSyncMessagesMutex.Lock()
+	defer knownSyncMessagesMutex.Unlock()
+
+	for _, message := range newMessages {
+		if _, ok := knownSyncMessages[nodeID]; !ok {
+			knownSyncMessages[nodeID] = map[int]struct{}{}
+		}
+		knownSyncMessages[nodeID][message] = struct{}{}
+	}
+}
+
+func syncScheduler(duration time.Duration) {
 	for range time.Tick(duration) {
 		go syncWithNeighbors()
 	}
@@ -128,13 +169,36 @@ func syncJob(duration time.Duration) {
 
 func syncWithNeighbors() {
 	for _, neighborID := range topology[n.ID()] {
-		body := SyncMessage{
-			Type:     "sync",
-			Messages: getMessages(),
-		}
-		err := n.Send(neighborID, body)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "[syncWithNeighbors]: neighborID: %v - err: %v ", neighborID, err)
-		}
+		go func(nodeID string) {
+			unknownMessages := getUnknownMessages(nodeID)
+			if len(unknownMessages) == 0 {
+				return
+			}
+
+			body := SyncMessage{
+				Type:     "sync",
+				Messages: unknownMessages,
+			}
+
+			err := n.RPC(nodeID, body, func(msg maelstrom.Message) error {
+				return syncResponseHandler(nodeID, unknownMessages, msg)
+			})
+
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "[syncWithNeighbors]: nodeID: %v - err: %v\n", nodeID, err)
+			}
+		}(neighborID)
 	}
+}
+
+func syncResponseHandler(neighborID string, unknownMessages []int, msg maelstrom.Message) error {
+	var body SyncMessage
+	if err := json.Unmarshal(msg.Body, &body); err != nil {
+		return err
+	}
+
+	addMessages(body.Messages)
+	addKnownSyncMessages(neighborID, unknownMessages)
+
+	return nil
 }
